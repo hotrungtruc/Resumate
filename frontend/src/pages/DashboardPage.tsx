@@ -1,11 +1,13 @@
 import { useState, useEffect, CSSProperties } from 'react';
 import DashboardLayout from '../components/dashboard/DashboardLayout';
+import OnboardingModal from '../components/OnboardingModal';
 import api from '../api/axios';
 import EditGoalsModal from '../components/dashboard/EditGoalsModal';
 
 const DashboardPage = () => {
   const [userData, setUserData] = useState<any>(null);
   const [isModalOpen, setIsModalOpen] = useState(false);
+  const [isOnboardingOpen, setIsOnboardingOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
@@ -16,6 +18,11 @@ const DashboardPage = () => {
         setError(null);
         const res = await api.get('/users/me');
         setUserData(res.data);
+
+        // Show onboarding modal if user hasn't completed it
+        if (!res.data.has_completed_onboarding) {
+          setIsOnboardingOpen(true);
+        }
       } catch (err: any) {
         const errorMessage = err?.response?.data?.detail || 'Failed to load dashboard';
         setError(errorMessage);
@@ -26,6 +33,22 @@ const DashboardPage = () => {
     };
     fetchUserData();
   }, []);
+
+  const handleOnboardingComplete = async (method: 'linkedin' | 'cv' | 'skip') => {
+    try {
+      // Re-fetch user data to confirm onboarding flag was set on backend
+      const res = await api.get('/users/me');
+      setUserData(res.data);
+      setIsOnboardingOpen(false);
+      console.log(`Onboarding completed via: ${method}`);
+    } catch (err: any) {
+      const errorMessage = err?.response?.data?.detail || 'Failed to confirm onboarding';
+      setError(errorMessage);
+      console.error('Error confirming onboarding:', err);
+      // Still close the modal even if re-fetch fails, since onboarding was already updated
+      setIsOnboardingOpen(false);
+    }
+  };
 
   const handleSaveGoals = async (formData: any) => {
     try {
@@ -206,6 +229,11 @@ const DashboardPage = () => {
             salary_max: userData.salary_max || 0,
             currency: (userData.currency || '').trim() || 'US Dollar',
           }}
+        />
+
+        <OnboardingModal
+          isOpen={isOnboardingOpen}
+          onComplete={handleOnboardingComplete}
         />
 
         {/* Row 2 & 3: Main Widgets */}

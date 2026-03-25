@@ -42,12 +42,77 @@ def _normalize_email(email: EmailStr) -> str:
     return str(email).strip().lower()
 
 
+def _create_new_user_doc(
+    email: str, full_name: str | None = None, **oauth_fields
+) -> dict:
+    """
+    Create a new user document with all required fields initialized to defaults.
+
+    This ensures that all fields defined in UserBase/UserInDB are present with
+    proper default values, preventing validation errors when the document is
+    retrieved from MongoDB and validated with Pydantic.
+
+    Args:
+        email: User email (normalized)
+        full_name: User's full name (optional)
+        **oauth_fields: OAuth-specific fields (google_id, facebook_id, avatar_url, etc.)
+
+    Returns:
+        Complete user document ready for insertion into MongoDB
+    """
+    return {
+        "email": email,
+        "full_name": full_name,
+        "hashed_password": None,  # No password for OAuth users
+        **oauth_fields,
+        "is_active": True,
+        # Initialize all UserBase fields with defaults
+        "role": "user",
+        "tier": "free",
+        "preferences": {
+            "theme": "system",
+            "language": "en",
+            "notifications_enabled": True,
+            "email_notifications": True,
+        },
+        "next_career_goal": None,
+        "target_title": None,
+        "target_date": None,
+        "salary_min": 0,
+        "salary_max": 0,
+        "currency": "US Dollar",
+        "has_completed_onboarding": False,
+        "created_at": datetime.now(timezone.utc),
+        "updated_at": datetime.now(timezone.utc),
+    }
+
+
 def _build_auth_response(user_doc: dict) -> AuthResponse:
-    user = UserInDB.model_validate(user_doc)
-    token = create_access_token({"sub": user.email, "uid": str(user.id)})
-    return AuthResponse(
-        access_token=token, user=user.model_dump(exclude={"hashed_password"})
-    )
+    """
+    Build an authentication response from a user document.
+
+    Validates the user document against the UserInDB model and creates a JWT token.
+
+    Args:
+        user_doc: User document from MongoDB
+
+    Returns:
+        AuthResponse with access token and user profile
+
+    Raises:
+        ValueError: If user_doc doesn't match UserInDB schema
+    """
+    try:
+        user = UserInDB.model_validate(user_doc)
+        token = create_access_token({"sub": user.email, "uid": str(user.id)})
+        return AuthResponse(
+            access_token=token, user=user.model_dump(exclude={"hashed_password"})
+        )
+    except Exception as e:
+        logger.error(
+            f"Failed to build auth response for user: {str(e)}, doc: {user_doc}"
+        )
+        raise
 
 
 @router.post("/register")
@@ -153,31 +218,50 @@ async def google_login(request: Request, payload: OAuthRequest):
         user_doc = await users.find_one({"google_id": google_id})
 
         if not user_doc:
-            # Check if email exists but not linked to Google
-            existing_email = await users.find_one({"email": email, "google_id": None})
+            # Check if email exists (either with or without Google linked)
+            existing_email = await users.find_one({"email": email})
             if existing_email:
-                # User has existing account but not linked to Google - require confirmation
-                logger.warning(
-                    f"Attempt to link Google account to existing email: {email}"
-                )
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Email already has an account. Please login with password first to link Google.",
-                )
+                # Auto-login: Link Google to existing account if not already linked
+                user_doc = existing_email
+                update_data = {"updated_at": datetime.now(timezone.utc)}
 
-            # Create new user
-            user_doc = {
-                "email": email,
-                "full_name": full_name,
-                "google_id": google_id,
-                "avatar_url": avatar_url,
-                "is_active": True,
-                "created_at": datetime.now(timezone.utc),
-                "updated_at": datetime.now(timezone.utc),
-            }
-            result = await users.insert_one(user_doc)
-            user_doc["_id"] = result.inserted_id
-            logger.info(f"New user created via Google: {email}")
+                # Add google_id if not already set
+                if not user_doc.get("google_id"):
+                    update_data["google_id"] = google_id
+                    logger.info(f"Google account linked to existing user: {email}")
+
+                # Update avatar if provided and different
+                if avatar_url and user_doc.get("avatar_url") != avatar_url:
+                    update_data["avatar_url"] = avatar_url
+
+                # Update user document
+                await users.update_one({"_id": user_doc["_id"]}, {"$set": update_data})
+            else:
+                # Create new user with all required fields initialized
+                user_doc = _create_new_user_doc(
+                    email=email,
+                    full_name=full_name,
+                    google_id=google_id,
+                    avatar_url=avatar_url,
+                )
+                try:
+                    result = await users.insert_one(user_doc)
+                    if not result.inserted_id:
+                        logger.error(f"Insert returned no ID for user: {email}")
+                        raise HTTPException(
+                            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                            detail="Failed to create user account - no ID returned",
+                        )
+                    user_doc["_id"] = result.inserted_id
+                    logger.info(
+                        f"New user created via Google: {email} with ID: {result.inserted_id}"
+                    )
+                except Exception as insert_err:
+                    logger.error(
+                        f"Failed to insert user document: {str(insert_err)}",
+                        exc_info=True,
+                    )
+                    raise
         else:
             # Update avatar if changed
             if avatar_url and user_doc.get("avatar_url") != avatar_url:
@@ -192,6 +276,16 @@ async def google_login(request: Request, payload: OAuthRequest):
                 )
 
         refreshed_user_doc = await users.find_one({"_id": user_doc["_id"]})
+        if not refreshed_user_doc:
+            logger.error(
+                f"CRITICAL: Could not retrieve user after creation. User ID: {user_doc.get('_id')}, Email: {email}"
+            )
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to create user account - persistence error",
+            )
+
+        logger.info(f"Successfully retrieved user from database: {email}")
         return _build_auth_response(refreshed_user_doc)
     except HTTPException:
         raise
@@ -200,10 +294,17 @@ async def google_login(request: Request, payload: OAuthRequest):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid Google token"
         )
-    except Exception as e:
-        logger.error(f"Google login error: {str(e)}")
+    except ValueError as e:
+        logger.error(f"Google login validation error: {str(e)}")
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, detail="Google login failed"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to process user data",
+        )
+    except Exception as e:
+        logger.error(f"Google login error: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Google login failed",
         )
 
 
@@ -248,33 +349,54 @@ async def facebook_login(request: Request, payload: OAuthRequest):
             user_doc = await users.find_one({"facebook_id": fb_id})
 
             if not user_doc:
-                # Check if email exists without Facebook link
-                existing_email = await users.find_one(
-                    {"email": email, "facebook_id": None}
-                )
+                # Check if email exists (either with or without Facebook linked)
+                existing_email = await users.find_one({"email": email})
                 if existing_email:
-                    # User has existing account but not linked to Facebook
-                    logger.warning(
-                        f"Attempt to link Facebook account to existing email: {email}"
-                    )
-                    raise HTTPException(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        detail="Email already has an account. Please login with password first to link Facebook.",
-                    )
+                    # Auto-login: Link Facebook to existing account if not already linked
+                    user_doc = existing_email
+                    update_data = {"updated_at": datetime.now(timezone.utc)}
 
-                # Create new user
-                user_doc = {
-                    "email": email,
-                    "full_name": full_name,
-                    "facebook_id": fb_id,
-                    "avatar_url": avatar_url,
-                    "is_active": True,
-                    "created_at": datetime.now(timezone.utc),
-                    "updated_at": datetime.now(timezone.utc),
-                }
-                result = await users.insert_one(user_doc)
-                user_doc["_id"] = result.inserted_id
-                logger.info(f"New user created via Facebook: {email}")
+                    # Add facebook_id if not already set
+                    if not user_doc.get("facebook_id"):
+                        update_data["facebook_id"] = fb_id
+                        logger.info(
+                            f"Facebook account linked to existing user: {email}"
+                        )
+
+                    # Update avatar if provided and different
+                    if avatar_url and user_doc.get("avatar_url") != avatar_url:
+                        update_data["avatar_url"] = avatar_url
+
+                    # Update user document
+                    await users.update_one(
+                        {"_id": user_doc["_id"]}, {"$set": update_data}
+                    )
+                else:
+                    # Create new user with all required fields initialized
+                    user_doc = _create_new_user_doc(
+                        email=email,
+                        full_name=full_name,
+                        facebook_id=fb_id,
+                        avatar_url=avatar_url,
+                    )
+                    try:
+                        result = await users.insert_one(user_doc)
+                        if not result.inserted_id:
+                            logger.error(f"Insert returned no ID for user: {email}")
+                            raise HTTPException(
+                                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                                detail="Failed to create user account - no ID returned",
+                            )
+                        user_doc["_id"] = result.inserted_id
+                        logger.info(
+                            f"New user created via Facebook: {email} with ID: {result.inserted_id}"
+                        )
+                    except Exception as insert_err:
+                        logger.error(
+                            f"Failed to insert user document: {str(insert_err)}",
+                            exc_info=True,
+                        )
+                        raise
             else:
                 # Update avatar if changed
                 if avatar_url and user_doc.get("avatar_url") != avatar_url:
@@ -289,11 +411,83 @@ async def facebook_login(request: Request, payload: OAuthRequest):
                     )
 
             refreshed_user_doc = await users.find_one({"_id": user_doc["_id"]})
+            if not refreshed_user_doc:
+                logger.error(
+                    f"CRITICAL: Could not retrieve user after creation. User ID: {user_doc.get('_id')}, Email: {email}"
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Failed to create user account - persistence error",
+                )
+
+            logger.info(f"Successfully retrieved user from database: {email}")
             return _build_auth_response(refreshed_user_doc)
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(f"Facebook login error: {str(e)}")
+    except ValueError as e:
+        logger.error(f"Facebook login validation error: {str(e)}")
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, detail="Facebook login failed"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to process user data",
         )
+    except Exception as e:
+        logger.error(f"Facebook login error: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Facebook login failed",
+        )
+
+
+@router.get("/debug/check-db")
+async def check_database_connection():
+    """
+    Diagnostic endpoint to check if database is working correctly.
+    WARNING: Only use for debugging - should be removed in production.
+    """
+    try:
+        db = get_client().get_default_database()
+        users_collection = db["users"]
+
+        # Test 1: Can we access the collection?
+        collection_info = await users_collection.estimated_document_count()
+        logger.info(f"Database check: Found {collection_info} users in database")
+
+        # Test 2: Can we write to the collection?
+        test_doc = {
+            "email": f"test-{datetime.now(timezone.utc).timestamp()}@test.com",
+            "is_test": True,
+            "created_at": datetime.now(timezone.utc),
+        }
+        result = await users_collection.insert_one(test_doc)
+        inserted_id = result.inserted_id
+
+        if not inserted_id:
+            logger.error("Write test failed: No inserted ID returned")
+            return {"status": "FAILED", "error": "Write test failed - no ID"}
+
+        logger.info(f"Write test passed: Inserted {inserted_id}")
+
+        # Test 3: Can we read what we just wrote?
+        retrieved_doc = await users_collection.find_one({"_id": inserted_id})
+        if not retrieved_doc:
+            logger.error(f"Read test failed: Could not retrieve document {inserted_id}")
+            return {"status": "FAILED", "error": "Read test failed"}
+
+        logger.info(f"Read test passed: Retrieved document {inserted_id}")
+
+        # Clean up test document
+        await users_collection.delete_one({"_id": inserted_id})
+
+        return {
+            "status": "OK",
+            "message": "Database is working correctly",
+            "total_users": collection_info,
+            "write_test": "PASSED",
+            "read_test": "PASSED",
+        }
+    except Exception as e:
+        logger.error(f"Database diagnostic failed: {str(e)}", exc_info=True)
+        return {
+            "status": "FAILED",
+            "error": str(e),
+        }

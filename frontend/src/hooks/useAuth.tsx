@@ -7,6 +7,7 @@ import {
   useState,
 } from 'react';
 import api from '../api/axios';
+import { authEventEmitter } from '../utils/authEvents';
 
 type User = {
   id?: string;
@@ -147,9 +148,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     return () => {
       isMounted = false;
     };
-  }, [clearAuth]);
+  }, []);
 
-  // Token expiration check
+  // Token expiration check with proper event emission
   useEffect(() => {
     if (!token) return;
 
@@ -160,16 +161,25 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     if (expiresIn <= 0) {
       // Token already expired
       clearAuth();
+      authEventEmitter.sessionExpired();
       return;
     }
 
-    // Check token 1 minute before expiration
-    const timeout = setTimeout(() => {
+    // Warn user 2 minutes before expiration
+    const warningTimeout = setTimeout(() => {
+      authEventEmitter.sessionExpiringsoon();
+    }, Math.max(0, expiresIn - 120000));
+
+    // Logout 1 minute before expiration
+    const logoutTimeout = setTimeout(() => {
       clearAuth();
-      setError('Session expired. Please login again.');
+      authEventEmitter.sessionExpired();
     }, Math.max(0, expiresIn - 60000));
 
-    return () => clearTimeout(timeout);
+    return () => {
+      clearTimeout(warningTimeout);
+      clearTimeout(logoutTimeout);
+    };
   }, [token, clearAuth]);
 
   const login = useCallback(

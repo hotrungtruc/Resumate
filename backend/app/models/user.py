@@ -66,6 +66,8 @@ class UserBase(BaseModel):
     salary_min: int = Field(0, ge=0)
     salary_max: int = Field(0, ge=0)
     currency: str = "US Dollar"
+    # Onboarding
+    has_completed_onboarding: bool = False
 
 
 class UserCreate(UserBase):
@@ -107,6 +109,8 @@ class UserUpdate(BaseModel):
     currency: Optional[str] = None
     # Preferences can be updated by user
     preferences: Optional[UserPreferences] = None
+    # Onboarding
+    has_completed_onboarding: Optional[bool] = None
 
     @model_validator(mode="after")
     def validate_user_update(self) -> UserUpdate:
